@@ -1,6 +1,7 @@
 import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 import docx
 from docx.shared import Pt, Mm, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -13,7 +14,7 @@ from collections import defaultdict
 BOT_TOKEN = "8141487259:AAEYJ9Qtbrdaz411UP35qhY7f8OVdNFZJ_s"
 
 # Настройки проверки
-REQUIRED_HEADERS_LOWER = ["введение", "список используемых источников", "заключение"]
+REQUIRED_HEADERS_LOWER = ["введение", "список источников литературы", "заключение"]
 OPTIONAL_HEADERS_LOWER = ["содержание", "приложение"]
 MAIN_FONT_SIZE = 14
 MAIN_FONT_NAME = "Times New Roman"
@@ -31,9 +32,13 @@ RIGHT_MARGIN = 15
 TOP_MARGIN = 20
 BOTTOM_MARGIN = 20
 MARGIN_TOLERANCE = 1  # Допустимое отклонение в мм
+PARAGRAPH_SPACING = 0  # Интервалы перед и после абзаца должны быть 0 pt
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Глобальная переменная для хранения временных файлов
+user_documents = {}
 
 
 def is_bold(paragraph):
@@ -124,6 +129,14 @@ def check_line_spacing(paragraph_format):
     return False
 
 
+def check_paragraph_spacing(paragraph_format):
+    """Проверяет, что интервалы перед и после абзаца равны 0 pt"""
+    if (paragraph_format.space_before is not None and paragraph_format.space_before.pt > 0) or \
+            (paragraph_format.space_after is not None and paragraph_format.space_after.pt > 0):
+        return False
+    return True
+
+
 def check_first_line_indent(paragraph_format):
     """Проверяет отступ первой строки с учетом всех возможных способов его задания"""
     # Допустимое отклонение в см
@@ -165,6 +178,82 @@ def check_first_line_indent(paragraph_format):
                     pass
 
     return False
+
+
+def find_title_page_end(doc):
+    """Определяет конец титульного листа (первый заголовок после титула)"""
+    for i, para in enumerate(doc.paragraphs):
+        text = para.text.strip().lower()
+        if any(header in text for header in REQUIRED_HEADERS_LOWER + OPTIONAL_HEADERS_LOWER):
+            return i
+    return min(5, len(doc.paragraphs))  # Если заголовки не найдены, считаем первые 5 параграфов титульным листом
+
+
+def fix_document(filename: str) -> str:
+    """Исправляет ошибки в документе и возвращает путь к исправленному файлу"""
+    doc = docx.Document(filename)
+
+    # Определяем конец титульного листа
+    title_page_end = find_title_page_end(doc)
+
+    # Исправляем поля для всего документа
+    for section in doc.sections:
+        section.left_margin = Mm(LEFT_MARGIN)
+        section.right_margin = Mm(RIGHT_MARGIN)
+        section.top_margin = Mm(TOP_MARGIN)
+        section.bottom_margin = Mm(BOTTOM_MARGIN)
+
+    # Исправляем стили текста, пропуская титульный лист
+    for para_idx, para in enumerate(doc.paragraphs):
+        if para_idx < title_page_end:
+            continue  # Пропускаем титульный лист
+
+        # Устанавливаем шрифт Times New Roman и размер
+        for run in para.runs:
+            run.font.name = MAIN_FONT_NAME
+            run.font.size = Pt(MAIN_FONT_SIZE)
+
+        # Определяем тип параграфа
+        style_name = para.style.name.lower()
+        is_heading = style_name.startswith('heading')
+        is_title = style_name in ['title', 'subtitle']
+        is_header = is_heading or is_title
+        text_lower = para.text.strip().lower()
+
+        # Для заголовков устанавливаем жирный шрифт
+        if is_header:
+            for run in para.runs:
+                run.font.bold = True
+
+        # Устанавливаем выравнивание
+        if is_header:
+            # Для обязательных и необязательных заголовков - по центру
+            if any(header in text_lower for header in REQUIRED_HEADERS_LOWER + OPTIONAL_HEADERS_LOWER):
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            # Для остальных заголовков - по левому краю
+            else:
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        else:
+            # Для обычного текста - по ширине
+            para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+        # Устанавливаем межстрочный интервал 1.5
+        para.paragraph_format.line_spacing = LINE_SPACING
+
+        # Устанавливаем интервалы перед и после абзаца в 0 pt
+        para.paragraph_format.space_before = Pt(PARAGRAPH_SPACING)
+        para.paragraph_format.space_after = Pt(PARAGRAPH_SPACING)
+
+        # Устанавливаем отступ первой строки (если это не заголовок и не элемент списка)
+        if not is_header and not is_list_paragraph(para):
+            para.paragraph_format.first_line_indent = Cm(PARAGRAPH_INDENT_CM)
+            para.paragraph_format.left_indent = Cm(0)
+            para.paragraph_format.right_indent = Cm(0)
+
+    # Сохраняем исправленный документ
+    fixed_filename = f"fixed_{os.path.basename(filename)}"
+    doc.save(fixed_filename)
+    return fixed_filename
 
 
 async def check_document(filename: str) -> List[Tuple[str, str]]:
@@ -215,7 +304,7 @@ async def check_document(filename: str) -> List[Tuple[str, str]]:
                         is_appendix_section = True
                         appendix_page_start = i
 
-                    if "список используемых источников" in text_lower or "список использованных источников" in text_lower:
+                    if "список источников литературы" in text_lower or "список использованных источников" in text_lower:
                         is_references_section = True
                         references_page_start = i
                     break
@@ -270,6 +359,13 @@ async def check_document(filename: str) -> List[Tuple[str, str]]:
 
         para_errors = defaultdict(set)
         example_text = text[:50] + ('...' if len(text) > 50 else '')
+
+        # Проверка интервалов между абзацами
+        if not check_paragraph_spacing(para.paragraph_format):
+            space_before = para.paragraph_format.space_before.pt if para.paragraph_format.space_before else 0
+            space_after = para.paragraph_format.space_after.pt if para.paragraph_format.space_after else 0
+            para_errors["❌ Интервалы перед и после абзаца должны быть 0 pt"].add(
+                f"Пример: '{example_text}'\nТекущие значения: перед {space_before} pt, после {space_after} pt")
 
         if is_header:
             text_lower = text.lower()
@@ -495,15 +591,67 @@ async def handle_docx_file(message: types.Message):
                     error_msg += f"• и ещё {len(unique_examples) - 3} подобных случаев\n"
                 error_msg += "\n"
 
-            await message.reply(error_msg[:4000])
+            # Сохраняем временный файл для возможного исправления
+            user_documents[message.from_user.id] = temp_filename
+
+            # Создаем клавиатуру с кнопкой "Исправить"
+            builder = InlineKeyboardBuilder()
+            builder.add(types.InlineKeyboardButton(
+                text="Исправить ошибки в документе",
+                callback_data=f"fix_document_{message.from_user.id}")
+            )
+
+            await message.reply(error_msg[:4000], reply_markup=builder.as_markup())
         else:
             await message.reply("✅ Документ соответствует всем требованиям!")
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
 
     except Exception as e:
         await message.reply(f"⚠ Ошибка при обработке файла: {str(e)}")
-    finally:
         if 'temp_filename' in locals() and os.path.exists(temp_filename):
             os.remove(temp_filename)
+
+
+@dp.callback_query(lambda c: c.data.startswith('fix_document_'))
+async def process_fix_document(callback: types.CallbackQuery):
+    user_id = int(callback.data.split('_')[-1])
+
+    if user_id not in user_documents:
+        await callback.answer("Файл для исправления не найден. Пожалуйста, отправьте документ снова.")
+        return
+
+    temp_filename = user_documents[user_id]
+
+    try:
+        await callback.answer("Исправляю документ...")
+
+        # Исправляем документ
+        fixed_filename = fix_document(temp_filename)
+
+        # Отправляем исправленный документ
+        with open(fixed_filename, 'rb') as file:
+            await bot.send_document(
+                chat_id=callback.message.chat.id,
+                document=types.BufferedInputFile(file.read(), filename=f"Исправленный_{fixed_filename}"),
+                caption="✅ Вот исправленный документ"
+            )
+
+        # Удаляем временные файлы
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
+        if os.path.exists(fixed_filename):
+            os.remove(fixed_filename)
+
+        # Удаляем запись о файле
+        del user_documents[user_id]
+
+    except Exception as e:
+        await callback.answer(f"Ошибка при исправлении документа: {str(e)}")
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
+        if 'fixed_filename' in locals() and os.path.exists(fixed_filename):
+            os.remove(fixed_filename)
 
 
 async def main():

@@ -20,7 +20,7 @@ MAIN_FONT_SIZE = 14
 MAIN_FONT_NAME = "Times New Roman"
 LINE_SPACING = 1.5
 PARAGRAPH_INDENT_CM = 1.25  # Отступ первой строки в см
-APPENDIX_PATTERN = re.compile(r'^Приложение [А-ДЕ-Я]$', re.IGNORECASE)
+APPENDIX_PATTERN = re.compile(r'^Приложение [А-ДЕ-Я](?:\s|$).*', re.IGNORECASE)
 FORBIDDEN_LETTERS = {'Ё', 'И'}  # Буквы, которые нельзя использовать в приложениях
 APPENDIX_ORDER = ['А', 'Б', 'В', 'Г', 'Д', 'Е', 'Ж', 'З', 'Й', 'К', 'Л', 'М',
                   'Н', 'О', 'П', 'Р', 'С', 'Т', 'У', 'Ф', 'Х', 'Ц', 'Ч', 'Ш', 'Щ',
@@ -273,10 +273,15 @@ async def check_document(filename: str) -> List[Tuple[str, str]]:
     is_appendix_section = False
     references_page_start = None
     is_references_section = False
+    skip_until = None  # Позиция, до которой нужно пропускать проверку (для приложений)
 
     for i, para in enumerate(doc.paragraphs):
         text = para.text.strip()
         if not text or text.startswith('\x0c'):
+            continue
+
+        # Если мы в режиме пропуска (после заголовка приложения), пропускаем параграф
+        if skip_until is not None and i <= skip_until:
             continue
 
         style_name = para.style.name.lower()
@@ -303,6 +308,16 @@ async def check_document(filename: str) -> List[Tuple[str, str]]:
                     if "приложение" in text_lower and not text_lower.startswith("приложение "):
                         is_appendix_section = True
                         appendix_page_start = i
+                        # Устанавливаем skip_until до следующего заголовка
+                        skip_until = None  # Сброс перед установкой нового значения
+                        for j in range(i + 1, len(doc.paragraphs)):
+                            next_para = doc.paragraphs[j]
+                            next_style = next_para.style.name.lower()
+                            if next_style.startswith('heading') or next_style in ['title', 'subtitle']:
+                                skip_until = j - 1
+                                break
+                        if skip_until is None:
+                            skip_until = len(doc.paragraphs) - 1
 
                     if "список источников литературы" in text_lower or "список использованных источников" in text_lower:
                         is_references_section = True
@@ -329,6 +344,7 @@ async def check_document(filename: str) -> List[Tuple[str, str]]:
         errors.append(("❌ Отсутствуют обязательные разделы",
                        ", ".join(h.capitalize() for h in missing_headers)))
 
+    skip_until = None  # Сбрасываем для основной проверки
     for para_idx, para in enumerate(doc.paragraphs):
         if para_idx < title_page_end or (content_page_end and title_page_end <= para_idx < content_page_end):
             continue
@@ -337,10 +353,23 @@ async def check_document(filename: str) -> List[Tuple[str, str]]:
         if not text:
             continue
 
+        # Если мы в режиме пропуска (после заголовка приложения), пропускаем параграф
+        if skip_until is not None and para_idx <= skip_until:
+            continue
+
         if text.lower().startswith('приложение'):
             if not APPENDIX_PATTERN.match(text):
                 break
             else:
+                # Нашли заголовок приложения - пропускаем все до следующего заголовка
+                for j in range(para_idx + 1, len(doc.paragraphs)):
+                    next_para = doc.paragraphs[j]
+                    next_style = next_para.style.name.lower()
+                    if next_style.startswith('heading') or next_style in ['title', 'subtitle']:
+                        skip_until = j - 1
+                        break
+                if skip_until is None:
+                    skip_until = len(doc.paragraphs) - 1
                 continue
 
         skip_indent_checks = is_references_section and para_idx >= references_page_start
@@ -492,6 +521,7 @@ async def check_document(filename: str) -> List[Tuple[str, str]]:
 
     appendices = []
     invalid_appendix_letters = []
+    skip_until = None  # Сбрасываем для проверки приложений
 
     for para_idx, para in enumerate(doc.paragraphs):
         if para_idx < title_page_end or (content_page_end and title_page_end <= para_idx < content_page_end):
@@ -501,9 +531,13 @@ async def check_document(filename: str) -> List[Tuple[str, str]]:
         if not text:
             continue
 
+        # Если мы в режиме пропуска (после заголовка приложения), пропускаем параграф
+        if skip_until is not None and para_idx <= skip_until:
+            continue
+
         if text.lower().startswith('приложение'):
             parts = text.split()
-            if len(parts) == 2:
+            if len(parts) >= 2:
                 letter = parts[1].upper()
 
                 if letter in FORBIDDEN_LETTERS:
@@ -512,6 +546,15 @@ async def check_document(filename: str) -> List[Tuple[str, str]]:
 
                 if APPENDIX_PATTERN.match(text):
                     appendices.append((text, letter))
+                    # Устанавливаем skip_until до следующего заголовка
+                    for j in range(para_idx + 1, len(doc.paragraphs)):
+                        next_para = doc.paragraphs[j]
+                        next_style = next_para.style.name.lower()
+                        if next_style.startswith('heading') or next_style in ['title', 'subtitle']:
+                            skip_until = j - 1
+                            break
+                    if skip_until is None:
+                        skip_until = len(doc.paragraphs) - 1
                 else:
                     invalid_appendix_letters.append(letter)
 
